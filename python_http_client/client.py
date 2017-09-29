@@ -2,29 +2,23 @@
 import json
 from .exceptions import handle_error
 
-try:
-    # Python 3
-    import urllib.request as urllib
-    from urllib.parse import urlencode
-    from urllib.error import HTTPError
-except ImportError:
-    # Python 2
-    import urllib2 as urllib
-    from urllib2 import HTTPError
-    from urllib import urlencode
+# Python 3
+import aiohttp
+from urllib.parse import urlencode
+from urllib.error import HTTPError
 
 
 class Response(object):
     """Holds the response from an API call."""
-    def __init__(self, response):
+    def __init__(self, code, body, headers):
         """
         :param response: The return value from a open call
                          on a urllib.build_opener()
         :type response:  urllib response object
         """
-        self._status_code = response.getcode()
-        self._body = response.read()
-        self._headers = response.info()
+        self._status_code = code
+        self._body = body
+        self._headers = headers
 
     @property
     def status_code(self):
@@ -59,6 +53,7 @@ class Client(object):
     """Quickly and easily access any REST or REST-like API."""
     def __init__(self,
                  host,
+                 session=None,
                  request_headers=None,
                  version=None,
                  url_path=None,
@@ -86,6 +81,17 @@ class Client(object):
         self.methods = ['delete', 'get', 'patch', 'post', 'put']
         # APPEND SLASH set
         self.append_slash = append_slash
+        # aiohttp session
+        if session is None:
+            self.session = aiohttp.ClientSession()
+            self.mark_session_for_deletion = True
+        else:
+            self.session = session
+            self.mark_session_for_deletion = False
+
+    def __del__(self):
+        if self.mark_session_for_deletion:
+            self.session.close()
 
     def _build_versioned_url(self, url):
         """Subclass this function for your own needs.
@@ -138,27 +144,11 @@ class Client(object):
         """
         url_path = self._url_path + [name] if name else self._url_path
         return Client(host=self.host,
+                      session=self.session,
                       version=self._version,
                       request_headers=self.request_headers,
                       url_path=url_path,
                       append_slash=self.append_slash)
-
-    def _make_request(self, opener, request):
-        """Make the API call and return the response. This is separated into
-           it's own function, so we can mock it easily for testing.
-
-        :param opener:
-        :type opener:
-        :param request: url payload to request
-        :type request: urllib.Request object
-        :return: urllib response
-        """
-        try:
-            return opener.open(request)
-        except HTTPError as err:
-            exc = handle_error(err)
-            exc.__cause__ = None
-            raise exc
 
     def _(self, name):
         """Add variable values to the url.
@@ -196,7 +186,7 @@ class Client(object):
         if name in self.methods:
             method = name.upper()
 
-            def http_request(*_, **kwargs):
+            async def http_request(*_, **kwargs):
                 """Make the API call
                 :param args: unused
                 :param kwargs:
@@ -216,15 +206,16 @@ class Client(object):
                     else:
                         data = json.dumps(kwargs['request_body']).encode('utf-8')
                 params = kwargs['query_params'] if 'query_params' in kwargs else None
-                opener = urllib.build_opener()
-                request = urllib.Request(self._build_url(params), data=data)
-                if self.request_headers:
-                    for key, value in self.request_headers.items():
-                        request.add_header(key, value)
+                headers = dict()
+                headers.update(self.request_headers)
                 if data and not ('Content-Type' in self.request_headers):
-                    request.add_header('Content-Type', 'application/json')
-                request.get_method = lambda: method
-                return Response(self._make_request(opener, request))
+                    headers['Content-Type'] = 'application/json'
+                async with self.session.request(method, self._build_url(params), data=data, headers=headers) as resp:
+                    return Response(
+                      resp.status,
+                      await resp.text(),
+                      resp.headers
+                    )
             return http_request
         else:
             # Add a segment to the URL
